@@ -15,8 +15,13 @@ import re
 import sys
 import argparse
 from pathlib import Path
-import yaml
 import json
+from ruamel.yaml import YAML
+from collections.abc import Mapping, Sequence
+
+yaml = YAML(typ='safe', pure=True) #rt keep order, safe reorder
+yaml.default_flow_style = False
+yaml.preserve_quotes = True   
 
 DURATION_RE = re.compile(r'^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$')
 
@@ -57,44 +62,24 @@ def delete_recursive(obj, path):
         # all three creationTimestamp keys removed
     """
     parts = path.split(",")
-
-    def _remove(o, parts):
-        if not parts:
-            return 0
-        head, *tail = parts
-        removed = 0
-
-        if isinstance(o, dict):
-            # If the head key exists at this level, try to remove/recurse into it
-            if head in o:
-                if not tail:
-                    # final part: delete the key at this level
-                    del o[head]
-                    return 1
-                else:
-                    removed += _remove(o[head], tail)
-            # Also continue searching other values for matches deeper in the structure
-            for v in list(o.values()):
-                removed += _remove(v, parts)
-        elif isinstance(o, list):
-            for item in o:
-                removed += _remove(item, parts)
-        # primitives / None -> nothing to do
-        return removed
-
-    return _remove(obj, parts)
+    o = obj
+    *init,tail = parts
+    found = True
+    for i in init:
+        if i in o:
+            o = o[i]
+        else:
+            found = False
+            break
+    if found:
+        if tail in o:
+            del o[tail]
 
 def walk(obj):
     # Recursively walk the YAML structure and normalize strings.
-    if isinstance(obj, dict):
-        delete_recursive(obj, "metadata,creationTimestamp")
-        delete_recursive(obj, "metadata,generation")
-        delete_recursive(obj, "metadata,labels,paas.redhat.com/appcode")
-        delete_recursive(obj, "metadata,namespace")
-        delete_recursive(obj, "metadata,resourceVersion")
-        delete_recursive(obj, "metadata,uid")
+    if isinstance(obj, Mapping):
         new = {}
-        for k, v in obj.items():
+        for k,v in list(obj.items()):
             if k == "timeout" and isinstance(v, str):
                 new[k] = normalize_duration(v)
             elif k == "kind" and v == "Task":
@@ -120,16 +105,22 @@ def walk(obj):
             else:
                 new[k] = walk(v)
         return new
-    elif isinstance(obj, list):
-        return [walk(i) for i in obj]
+    elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+        return [walk(i) for i in list(obj)]
     else:
         return obj
 
 def process_stream(stream):
-    docs = list(yaml.safe_load_all(stream))
-    out_docs = [walk(doc) for doc in docs]
+    out_docs = yaml.load(stream)
+    delete_recursive(out_docs, "metadata,creationTimestamp")
+    delete_recursive(out_docs, "metadata,generation")
+    delete_recursive(out_docs, "metadata,labels,paas.redhat.com/appcode")
+    delete_recursive(out_docs, "metadata,namespace")
+    delete_recursive(out_docs, "metadata,resourceVersion")
+    delete_recursive(out_docs, "metadata,uid")
+    out_docs = walk(out_docs)
     # Dump with safe_dump_all
-    return yaml.safe_dump_all(out_docs, default_flow_style=False) #, sort_keys=False
+    return yaml.dump(out_docs, sys.stdout)
 
 def main():
     p = argparse.ArgumentParser()
@@ -138,8 +129,7 @@ def main():
     args = p.parse_args()
 
     if not args.paths:
-        out = process_stream(sys.stdin)
-        sys.stdout.write(out)
+        process_stream(sys.stdin)
         return
 
     for path in args.paths:
@@ -149,14 +139,6 @@ def main():
             continue
         text = path.read_text()
         out = process_stream(text)
-        if args.inplace:
-            # safe write via temp file
-            tmp = path.with_suffix(path.suffix + ".normalize_tmp")
-            tmp.write_text(out)
-            tmp.replace(path)
-            print(f"normalized {path}")
-        else:
-            sys.stdout.write(out)
 
 if __name__ == "__main__":
     main()
